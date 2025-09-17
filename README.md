@@ -1,13 +1,18 @@
-# FPL Data Service
+# FPL Research - Fantasy Premier League Data Service
 
-Production-ready unified service for monitoring and synchronizing Fantasy Premier League data to Supabase.
+A comprehensive Fantasy Premier League data monitoring and API service that provides real-time player statistics, team data, fixtures, and gameweek information for iOS app development.
 
-## Files
+## Features
+- **Automated Data Sync**: Continuous monitoring of FPL API for data changes with intelligent refresh triggers
+- **RESTful API**: FastAPI-based backend serving structured FPL data with filtering, sorting, and pagination
+- **Real-time Monitoring**: Detects gameweek completions, fixture updates, and player stat changes
+- **Supabase Integration**: Robust database storage with materialized views for optimized queries
+- **iOS-Ready**: CORS-enabled API designed for mobile app consumption
 
-- `fpl_service.py` - **Unified monitoring and refresh service** (recommended)
-- `requirements.txt` - Python dependencies
-- `supabase_migrations/` - Database schema files
-- `DEPLOYMENT.md` - Server deployment guide
+## Architecture
+- **Data Service** (`fpl_service.py`): Monitors FPL API and syncs data to Supabase
+- **API Backend** (`backend/`): FastAPI server with endpoints for players, teams, fixtures, and gameweeks
+- **Database**: Supabase PostgreSQL with automated migrations and materialized views
 
 ## Quick Start
 
@@ -48,3 +53,11 @@ See `DEPLOYMENT.md` for detailed server deployment instructions including:
 - DigitalOcean droplet setup
 - Service configuration
 - Monitoring and troubleshooting
+
+## Tech Stack
+- Python (FastAPI, asyncio, requests)
+- Supabase (PostgreSQL)
+- FPL Official API
+- Automated monitoring and data refresh
+
+Perfect for FPL enthusiasts building mobile apps or data analysis tools that need reliable, up-to-date Premier League fantasy data.
