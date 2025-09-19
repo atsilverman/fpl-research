@@ -124,6 +124,178 @@ class GameweekResponse(BaseModel):
     gameweeks: List[Gameweek]
     total: int
 
+class PlayerGameweekStats(BaseModel):
+    """Player gameweek stats model"""
+    id: int
+    player_id: int
+    gameweek_id: int
+    fixture_id: Optional[int] = None
+    minutes: int
+    goals_scored: int
+    assists: int
+    clean_sheets: int
+    goals_conceded: int
+    own_goals: int
+    penalties_saved: int
+    penalties_missed: int
+    yellow_cards: int
+    red_cards: int
+    saves: int
+    bonus: int
+    bps: int
+    influence: Optional[float] = None
+    creativity: Optional[float] = None
+    threat: Optional[float] = None
+    ict_index: Optional[float] = None
+    total_points: int
+    # Expected data fields
+    expected_goals: float
+    expected_assists: float
+    expected_goal_involvements: float
+    expected_goals_conceded: float
+    clearances_blocks_interceptions: int
+    recoveries: int
+    tackles: int
+    defensive_contribution: int
+    starts: int
+    created_at: datetime
+    updated_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+class PlayerGameweekStatsResponse(BaseModel):
+    """Player gameweek stats response with pagination"""
+    stats: List[PlayerGameweekStats]
+    total: int
+    limit: int
+    offset: int
+
+class TeamGameweekStats(BaseModel):
+    """Team gameweek stats model"""
+    id: int
+    team_id: int
+    gameweek_id: int
+    fixture_id: Optional[int] = None
+    is_home: bool
+    opponent_team_id: Optional[int] = None
+    difficulty: Optional[int] = None
+    
+    # Match results
+    goals_for: int
+    goals_against: int
+    result: Optional[str] = None  # 'W', 'D', 'L'
+    
+    # Fantasy performance
+    total_fantasy_points: int
+    avg_fantasy_points: float
+    players_played: int
+    players_started: int
+    
+    # Attacking stats
+    goals_scored: int
+    assists: int
+    own_goals: int = 0
+    penalties_missed: int = 0
+    
+    # Expected attacking stats
+    expected_goals: float
+    expected_assists: float
+    expected_goal_involvements: float
+    
+    # Defensive stats
+    clean_sheets: int
+    saves: int
+    penalties_saved: int = 0
+    tackles: int
+    clearances_blocks_interceptions: int = 0
+    recoveries: int = 0
+    defensive_contribution: int = 0
+    
+    # Discipline stats
+    yellow_cards: int
+    red_cards: int
+    
+    # ICT metrics
+    total_influence: float
+    total_creativity: float
+    total_threat: float
+    total_ict_index: float
+    avg_influence: float
+    avg_creativity: float
+    avg_threat: float
+    avg_ict_index: float
+    
+    # Form and trends
+    form_6_gw: float
+    form_3_gw: float
+    
+    created_at: datetime
+    updated_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+class TeamGameweekStatsResponse(BaseModel):
+    """Team gameweek stats response with pagination"""
+    data: List[TeamGameweekStats]
+    total: int
+    limit: int
+    offset: int
+
+class TeamFormTrends(BaseModel):
+    """Team form trends model"""
+    team_id: int
+    team_name: str
+    gameweek_id: int
+    gameweek_name: str
+    is_home: bool
+    opponent_team_id: Optional[int] = None
+    opponent_name: Optional[str] = None
+    difficulty: Optional[int] = None
+    goals_for: int
+    goals_against: int
+    result: Optional[str] = None
+    total_fantasy_points: int
+    form_6_gw: float
+    form_3_gw: float
+    expected_goals: float
+    expected_goals_conceded: float
+    clean_sheets: int
+
+class TeamSeasonSummary(BaseModel):
+    """Team season summary model"""
+    team_id: int
+    team_name: str
+    games_played: int
+    wins: int
+    draws: int
+    losses: int
+    total_goals_for: int
+    total_goals_against: int
+    goal_difference: int
+    avg_fantasy_points: float
+    total_fantasy_points: int
+    avg_expected_goals: float
+    avg_expected_goals_conceded: float
+    total_clean_sheets: int
+    current_form_6_gw: float
+    current_form_3_gw: float
+
+class TeamHomeAwayStats(BaseModel):
+    """Team home/away stats model"""
+    team_id: int
+    team_name: str
+    is_home: bool
+    games_played: int
+    wins: int
+    draws: int
+    losses: int
+    avg_fantasy_points: float
+    avg_expected_goals: float
+    avg_expected_goals_conceded: float
+    total_clean_sheets: int
+
 class ErrorResponse(BaseModel):
     """Error response model"""
     detail: str

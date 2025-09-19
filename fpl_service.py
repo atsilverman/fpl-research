@@ -15,21 +15,38 @@ Usage:
 import json
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
 import argparse
 import requests
+import pytz
+
+# Configure logging with local timezone
+class PacificTimeFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=pytz.timezone('America/Los_Angeles'))
+        if datefmt:
+            s = dt.strftime(datefmt)
+        else:
+            s = dt.strftime('%Y-%m-%d %H:%M:%S %Z')
+        return s
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('fpl_service.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Create formatter
+formatter = PacificTimeFormatter('%(asctime)s - %(levelname)s - %(message)s')
+
+# File handler
+file_handler = logging.FileHandler('fpl_service.log')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
 class FPLService:
     """Unified FPL data monitoring and refresh service"""
@@ -47,6 +64,10 @@ class FPLService:
         self.check_interval = 3600  # 1 hour in seconds
         self.state_file = 'service_state.json'
         
+        # Configure timezone for easier debugging
+        self.local_tz = pytz.timezone('America/Los_Angeles')  # Pacific Time
+        self.utc_tz = pytz.UTC
+        
         # HTTP session
         self.session = requests.Session()
         self.session.headers.update({
@@ -54,23 +75,42 @@ class FPLService:
             'Accept': 'application/json'
         })
     
+    def now_local(self) -> datetime:
+        """Get current time in local timezone (Pacific Time)"""
+        return datetime.now(self.local_tz)
+    
+    def now_utc(self) -> datetime:
+        """Get current time in UTC"""
+        return datetime.now(self.utc_tz)
+    
+    def to_local(self, utc_dt: datetime) -> datetime:
+        """Convert UTC datetime to local timezone"""
+        if utc_dt.tzinfo is None:
+            utc_dt = self.utc_tz.localize(utc_dt)
+        return utc_dt.astimezone(self.local_tz)
+    
+    def to_utc(self, local_dt: datetime) -> datetime:
+        """Convert local datetime to UTC"""
+        if local_dt.tzinfo is None:
+            local_dt = self.local_tz.localize(local_dt)
+        return local_dt.astimezone(self.utc_tz)
+    
     def fetch_fpl_data(self, endpoint: str) -> Optional[Dict[str, Any]]:
         """Fetch data from FPL API with rate limiting"""
         url = f"{self.fpl_base_url}{endpoint}"
         
         try:
-            logger.info(f"Fetching {url}")
             response = self.session.get(url, timeout=30)
             response.raise_for_status()
             
             data = response.json()
-            logger.info(f"Successfully fetched {endpoint}")
+            logger.info(f"✓ Fetched {endpoint}")
             
             time.sleep(self.rate_limit_delay)
             return data
             
         except Exception as e:
-            logger.error(f"Error fetching {endpoint}: {e}")
+            logger.error(f"❌ Failed to fetch {endpoint}: {e}")
             return None
     
     def supabase_request(self, method: str, endpoint: str, data: Optional[Dict] = None) -> Optional[Dict]:
@@ -102,12 +142,20 @@ class FPLService:
             return {}
             
         except Exception as e:
-            logger.error(f"Supabase API error {method} {endpoint}: {e}")
+            # Suppress repetitive schema errors
             if hasattr(e, 'response') and e.response is not None:
-                logger.error(f"Response content: {e.response.text}")
+                error_text = e.response.text
+                if "clearances_blocks_interceptions" in error_text and not hasattr(self, '_schema_error_logged'):
+                    logger.error(f"❌ Schema error: Missing 'clearances_blocks_interceptions' column (suppressing further errors)")
+                    self._schema_error_logged = True
+                    return None
+            
+            logger.error(f"❌ Supabase API error {method} {endpoint}: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"Response: {e.response.text}")
             return None
     
-    def get_current_metrics(self) -> Dict[str, int]:
+    def get_current_metrics(self) -> Dict[str, Any]:
         """Get current key metrics from Supabase for change detection"""
         try:
             metrics = {}
@@ -117,119 +165,118 @@ class FPLService:
             if finished_gws is not None:
                 metrics['finished_gameweeks'] = len(finished_gws)
             else:
-                logger.error("Failed to get finished gameweeks count")
+                logger.error("❌ Failed to get finished gameweeks count")
                 return {}
             
-            # Check total fixtures count
-            fixtures = self.supabase_request('GET', '/fixtures?select=count')
-            if fixtures is not None:
-                metrics['total_fixtures'] = len(fixtures)
-            else:
-                logger.error("Failed to get fixtures count")
-                return {}
-            
-            # Check total player stats count
-            player_stats = self.supabase_request('GET', '/player_gw_stats?select=count')
-            if player_stats is not None:
-                metrics['total_player_stats'] = len(player_stats)
-            else:
-                logger.error("Failed to get player stats count")
-                return {}
-            
-            # Check current gameweek
-            current_gw = self.supabase_request('GET', '/gameweeks?is_current=eq.true&select=id')
+            # Get current gameweek deadline for deadline-based refresh
+            current_gw = self.supabase_request('GET', '/gameweeks?is_current=eq.true&select=id,deadline_time')
             if current_gw and len(current_gw) > 0:
                 metrics['current_gameweek'] = current_gw[0]['id']
+                metrics['current_deadline'] = current_gw[0]['deadline_time']
             else:
-                logger.warning("No current gameweek found")
+                logger.warning("⚠ No current gameweek found")
                 metrics['current_gameweek'] = 0
-            
-            # Check next gameweek
-            next_gw = self.supabase_request('GET', '/gameweeks?is_next=eq.true&select=id')
-            if next_gw and len(next_gw) > 0:
-                metrics['next_gameweek'] = next_gw[0]['id']
-            else:
-                logger.warning("No next gameweek found")
-                metrics['next_gameweek'] = 0
+                metrics['current_deadline'] = None
             
             return metrics
             
         except Exception as e:
-            logger.error(f"Error getting current metrics: {e}")
+            logger.error(f"❌ Failed to get current metrics: {e}")
             return {}
     
-    def load_previous_state(self) -> Dict[str, int]:
+    def load_previous_state(self) -> Dict[str, Any]:
         """Load previous monitoring state from file"""
         try:
             with open(self.state_file, 'r') as f:
                 state = json.load(f)
-                logger.info(f"Loaded previous state: {state}")
+                logger.info(f"✓ Loaded previous state")
                 return state
         except FileNotFoundError:
-            logger.info("No previous state file found, starting fresh")
+            logger.info("ℹ No previous state found, starting fresh")
             return {}
         except Exception as e:
-            logger.error(f"Error loading previous state: {e}")
+            logger.error(f"❌ Failed to load previous state: {e}")
             return {}
     
-    def save_current_state(self, metrics: Dict[str, int]) -> bool:
+    def save_current_state(self, metrics: Dict[str, Any], refresh_triggered: bool = False) -> bool:
         """Save current monitoring state to file"""
         try:
             state = {
-                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'timestamp': self.now_utc().isoformat(),
                 'metrics': metrics
             }
+            
+            # If refresh was triggered by deadline, mark it
+            if refresh_triggered and 'current_deadline' in metrics:
+                state['metrics']['last_deadline_refresh'] = metrics['current_deadline']
+            
             with open(self.state_file, 'w') as f:
                 json.dump(state, f, indent=2)
-            logger.info(f"Saved current state: {metrics}")
             return True
         except Exception as e:
-            logger.error(f"Error saving current state: {e}")
+            logger.error(f"❌ Failed to save state: {e}")
             return False
     
-    def detect_changes(self, current_metrics: Dict[str, int], previous_metrics: Dict[str, int]) -> bool:
+    def detect_changes(self, current_metrics: Dict[str, Any], previous_metrics: Dict[str, Any]) -> bool:
         """Detect if significant changes have occurred that require a refresh"""
         try:
             changes_detected = False
             
-            # Check for new finished gameweeks
+            # 1. Check for new finished gameweeks (primary trigger)
             if 'finished_gameweeks' in current_metrics and 'finished_gameweeks' in previous_metrics:
                 if current_metrics['finished_gameweeks'] > previous_metrics['finished_gameweeks']:
-                    logger.info(f"New finished gameweek detected: {previous_metrics['finished_gameweeks']} -> {current_metrics['finished_gameweeks']}")
+                    logger.info(f"✓ New finished gameweek: {previous_metrics['finished_gameweeks']} → {current_metrics['finished_gameweeks']}")
                     changes_detected = True
             
-            # Check for new fixtures
-            if 'total_fixtures' in current_metrics and 'total_fixtures' in previous_metrics:
-                if current_metrics['total_fixtures'] > previous_metrics['total_fixtures']:
-                    logger.info(f"New fixtures detected: {previous_metrics['total_fixtures']} -> {current_metrics['total_fixtures']}")
-                    changes_detected = True
-            
-            # Check for current gameweek change
-            if 'current_gameweek' in current_metrics and 'current_gameweek' in previous_metrics:
-                if current_metrics['current_gameweek'] != previous_metrics['current_gameweek']:
-                    logger.info(f"Current gameweek changed: {previous_metrics['current_gameweek']} -> {current_metrics['current_gameweek']}")
-                    changes_detected = True
-            
-            # Check for next gameweek change
-            if 'next_gameweek' in current_metrics and 'next_gameweek' in previous_metrics:
-                if current_metrics['next_gameweek'] != previous_metrics['next_gameweek']:
-                    logger.info(f"Next gameweek changed: {previous_metrics['next_gameweek']} -> {current_metrics['next_gameweek']}")
-                    changes_detected = True
+            # 2. Check for deadline + 1 hour trigger (secondary trigger for manager changes)
+            if self.should_refresh_after_deadline(current_metrics, previous_metrics):
+                logger.info("✓ Deadline + 1h refresh triggered")
+                changes_detected = True
             
             if not changes_detected:
-                logger.info("No significant changes detected")
+                logger.info("ℹ No changes detected")
             
             return changes_detected
             
         except Exception as e:
-            logger.error(f"Error detecting changes: {e}")
+            logger.error(f"❌ Failed to detect changes: {e}")
+            return False
+    
+    def should_refresh_after_deadline(self, current_metrics: Dict[str, Any], previous_metrics: Dict[str, Any]) -> bool:
+        """Check if we should refresh 1 hour after deadline"""
+        try:
+            # Check if we have current deadline info
+            if 'current_deadline' not in current_metrics or current_metrics['current_deadline'] is None:
+                return False
+            
+            current_deadline = current_metrics['current_deadline']
+            
+            # Check if we've already refreshed for this deadline
+            if 'last_deadline_refresh' in previous_metrics:
+                if previous_metrics['last_deadline_refresh'] == current_deadline:
+                    return False  # Already refreshed for this deadline
+            
+            # Parse deadline time
+            deadline_utc = datetime.fromisoformat(current_deadline.replace('Z', '+00:00'))
+            deadline_pacific = deadline_utc.astimezone(self.local_tz)
+            
+            # Check if deadline + 1 hour has passed
+            trigger_time = deadline_pacific + timedelta(hours=1)
+            now = self.now_local()
+            
+            if now >= trigger_time:
+                logger.info(f"✓ Deadline + 1h trigger: {deadline_pacific.strftime('%m/%d %H:%M')} → {trigger_time.strftime('%m/%d %H:%M')}")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to check deadline refresh: {e}")
             return False
     
     def upsert_data(self, table_name: str, data: List[Dict[str, Any]]) -> bool:
         """Upsert data to a table using individual upserts"""
         try:
-            logger.info(f"Upserting {len(data)} records to {table_name}")
-            
             success_count = 0
             for record in data:
                 # Try to update first
@@ -238,22 +285,23 @@ class FPLService:
                     success_count += 1
                 else:
                     # If update fails, try insert
-                    insert_result = self.supabase_request('POST', f'/{table_name}', [record])
+                    insert_result = self.supabase_request('POST', f'/{table_name}', record)
                     if insert_result is not None:
                         success_count += 1
             
-            logger.info(f"Successfully upserted {success_count}/{len(data)} records to {table_name}")
+            if success_count == len(data):
+                logger.info(f"✓ Updated {success_count} {table_name} records")
+            else:
+                logger.warning(f"⚠ Updated {success_count}/{len(data)} {table_name} records")
             return success_count > 0
             
         except Exception as e:
-            logger.error(f"Error upserting data to {table_name}: {e}")
+            logger.error(f"❌ Failed to update {table_name}: {e}")
             return False
     
     def sync_teams(self, teams_data: List[Dict[str, Any]]) -> bool:
         """Sync teams data to Supabase"""
         try:
-            logger.info(f"Syncing {len(teams_data)} teams")
-            
             teams = []
             for team in teams_data:
                 teams.append({
@@ -261,16 +309,7 @@ class FPLService:
                     'name': team['name'],
                     'short_name': team.get('short_name'),
                     'code': team.get('code'),
-                    'form': team.get('form'),
-                    'points': team.get('points', 0),
                     'position': team.get('position'),
-                    'played': team.get('played', 0),
-                    'win': team.get('win', 0),
-                    'draw': team.get('draw', 0),
-                    'loss': team.get('loss', 0),
-                    'goals_for': team.get('goals_for', 0),
-                    'goals_against': team.get('goals_against', 0),
-                    'goal_difference': team.get('goal_difference', 0),
                     'strength': team.get('strength'),
                     'strength_overall_home': team.get('strength_overall_home'),
                     'strength_overall_away': team.get('strength_overall_away'),
@@ -278,20 +317,18 @@ class FPLService:
                     'strength_attack_away': team.get('strength_attack_away'),
                     'strength_defence_home': team.get('strength_defence_home'),
                     'strength_defence_away': team.get('strength_defence_away'),
-                    'updated_at': datetime.now(timezone.utc).isoformat()
+                    'updated_at': self.now_utc().isoformat()
                 })
             
             return self.upsert_data('teams', teams)
             
         except Exception as e:
-            logger.error(f"Error syncing teams: {e}")
+            logger.error(f"❌ Failed to sync teams: {e}")
             return False
     
     def sync_players(self, players_data: List[Dict[str, Any]]) -> bool:
         """Sync players data to Supabase"""
         try:
-            logger.info(f"Syncing {len(players_data)} players")
-            
             players = []
             for player in players_data:
                 players.append({
@@ -316,20 +353,18 @@ class FPLService:
                     'can_transact': player.get('can_transact', True),
                     'in_dreamteam': player.get('in_dreamteam', False),
                     'removed': player.get('removed', False),
-                    'updated_at': datetime.now(timezone.utc).isoformat()
+                    'updated_at': self.now_utc().isoformat()
                 })
             
             return self.upsert_data('players', players)
             
         except Exception as e:
-            logger.error(f"Error syncing players: {e}")
+            logger.error(f"❌ Failed to sync players: {e}")
             return False
     
     def sync_gameweeks(self, events_data: List[Dict[str, Any]]) -> bool:
         """Sync gameweeks data to Supabase"""
         try:
-            logger.info(f"Syncing {len(events_data)} gameweeks")
-            
             gameweeks = []
             for event in events_data:
                 gameweeks.append({
@@ -343,20 +378,18 @@ class FPLService:
                     'data_checked': event.get('data_checked', False),
                     'highest_score': event.get('highest_score'),
                     'average_entry_score': event.get('average_entry_score'),
-                    'updated_at': datetime.now(timezone.utc).isoformat()
+                    'updated_at': self.now_utc().isoformat()
                 })
             
             return self.upsert_data('gameweeks', gameweeks)
             
         except Exception as e:
-            logger.error(f"Error syncing gameweeks: {e}")
+            logger.error(f"❌ Failed to sync gameweeks: {e}")
             return False
     
     def sync_fixtures(self, fixtures_data: List[Dict[str, Any]]) -> bool:
         """Sync fixtures data to Supabase"""
         try:
-            logger.info(f"Syncing {len(fixtures_data)} fixtures")
-            
             fixtures = []
             for fixture in fixtures_data:
                 fixtures.append({
@@ -370,23 +403,21 @@ class FPLService:
                     'kickoff_time': fixture.get('kickoff_time'),
                     'difficulty_home': fixture.get('team_h_difficulty'),
                     'difficulty_away': fixture.get('team_a_difficulty'),
-                    'updated_at': datetime.now(timezone.utc).isoformat()
+                    'updated_at': self.now_utc().isoformat()
                 })
             
             return self.upsert_data('fixtures', fixtures)
             
         except Exception as e:
-            logger.error(f"Error syncing fixtures: {e}")
+            logger.error(f"❌ Failed to sync fixtures: {e}")
             return False
     
     def sync_player_gw_stats_from_live(self, gameweek_id: int) -> bool:
         """Sync player gameweek stats from live gameweek endpoint"""
         try:
-            logger.info(f"Syncing player stats for gameweek {gameweek_id}")
-            
             live_data = self.fetch_fpl_data(f"/event/{gameweek_id}/live/")
             if not live_data or 'elements' not in live_data:
-                logger.warning(f"No live data available for gameweek {gameweek_id}")
+                logger.warning(f"⚠ No live data for GW{gameweek_id}")
                 return False
             
             player_stats = []
@@ -416,13 +447,20 @@ class FPLService:
                         'threat': stats.get('threat'),
                         'ict_index': stats.get('ict_index'),
                         'total_points': stats.get('total_points', 0),
-                        'value': stats.get('value'),
-                        'selected_by_percent': stats.get('selected_by_percent'),
-                        'updated_at': datetime.now(timezone.utc).isoformat()
+                        # Expected data fields
+                        'expected_goals': stats.get('expected_goals', 0),
+                        'expected_assists': stats.get('expected_assists', 0),
+                        'expected_goal_involvements': stats.get('expected_goal_involvements', 0),
+                        'expected_goals_conceded': stats.get('expected_goals_conceded', 0),
+                        'clearances_blocks_interceptions': stats.get('clearances_blocks_interceptions', 0),
+                        'recoveries': stats.get('recoveries', 0),
+                        'tackles': stats.get('tackles', 0),
+                        'defensive_contribution': stats.get('defensive_contribution', 0),
+                        'starts': stats.get('starts', 0),
+                        'updated_at': self.now_utc().isoformat()
                     })
             
             if player_stats:
-                logger.info(f"Upserting {len(player_stats)} player stats for gameweek {gameweek_id}")
                 # For player_gw_stats, we need to handle the composite key differently
                 success_count = 0
                 for stats in player_stats:
@@ -438,41 +476,237 @@ class FPLService:
                         if insert_result is not None:
                             success_count += 1
                 
-                logger.info(f"Successfully upserted {success_count}/{len(player_stats)} player stats for gameweek {gameweek_id}")
+                if success_count == len(player_stats):
+                    logger.info(f"✓ Updated {success_count} player stats for GW{gameweek_id}")
+                else:
+                    logger.warning(f"⚠ Updated {success_count}/{len(player_stats)} player stats for GW{gameweek_id}")
                 return success_count > 0
             else:
-                logger.warning(f"No player stats found for gameweek {gameweek_id}")
+                logger.warning(f"⚠ No player stats found for GW{gameweek_id}")
                 return True
             
         except Exception as e:
-            logger.error(f"Error syncing player stats for gameweek {gameweek_id}: {e}")
+            logger.error(f"❌ Failed to sync player stats for GW{gameweek_id}: {e}")
             return False
+    
+    def get_registered_manager_ids(self) -> List[int]:
+        """Get all registered manager IDs from user_entries table"""
+        try:
+            result = self.supabase_request('GET', '/user_entries?select=fpl_entry_id')
+            if result is None:
+                logger.warning("⚠ No registered managers found")
+                return []
+            
+            manager_ids = [entry['fpl_entry_id'] for entry in result if entry.get('fpl_entry_id')]
+            if manager_ids:
+                logger.info(f"✓ Found {len(manager_ids)} registered managers")
+            return manager_ids
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to get manager IDs: {e}")
+            return []
+    
+    def sync_user_entries(self) -> bool:
+        """Sync all user entries from registered manager IDs"""
+        try:
+            manager_ids = self.get_registered_manager_ids()
+            if not manager_ids:
+                logger.info("ℹ No registered managers to sync")
+                return True
+            
+            success_count = 0
+            for manager_id in manager_ids:
+                if self.sync_single_user_entry(manager_id):
+                    success_count += 1
+            
+            if success_count == len(manager_ids):
+                logger.info(f"✓ Updated {success_count} user entries")
+            else:
+                logger.warning(f"⚠ Updated {success_count}/{len(manager_ids)} user entries")
+            return success_count > 0
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to sync user entries: {e}")
+            return False
+    
+    def sync_single_user_entry(self, manager_id: int) -> bool:
+        """Sync single user's entry data"""
+        try:
+            entry_data = self.fetch_fpl_data(f"/entry/{manager_id}/")
+            if not entry_data:
+                logger.warning(f"⚠ No entry data for manager {manager_id}")
+                return False
+            
+            # Find the user_id for this manager_id
+            user_result = self.supabase_request('GET', f'/user_entries?fpl_entry_id=eq.{manager_id}&select=user_id')
+            if not user_result or len(user_result) == 0:
+                logger.warning(f"⚠ No user found for manager {manager_id}")
+                return False
+            
+            user_id = user_result[0]['user_id']
+            
+            # Update user_entries table
+            user_entry = {
+                'user_id': user_id,
+                'fpl_entry_id': manager_id,
+                'team_name': entry_data.get('name'),
+                'total_points': entry_data.get('summary_overall_points', 0),
+                'overall_rank': entry_data.get('summary_overall_rank'),
+                'team_value': entry_data.get('last_deadline_value'),
+                'bank': entry_data.get('last_deadline_bank'),
+                'updated_at': self.now_utc().isoformat()
+            }
+            
+            # Upsert user entry
+            update_result = self.supabase_request('PATCH', f'/user_entries?fpl_entry_id=eq.{manager_id}', user_entry)
+            if update_result is not None:
+                return True
+            else:
+                logger.warning(f"⚠ Failed to update manager {manager_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to sync manager {manager_id}: {e}")
+            return False
+    
+    def sync_user_picks_for_gameweek(self, manager_id: int, gameweek_id: int) -> bool:
+        """Sync user's picks for specific gameweek"""
+        try:
+            picks_data = self.fetch_fpl_data(f"/entry/{manager_id}/event/{gameweek_id}/picks/")
+            if not picks_data or 'picks' not in picks_data:
+                logger.warning(f"⚠ No picks data for manager {manager_id} GW{gameweek_id}")
+                return False
+            
+            # Find the user_id for this manager_id
+            user_result = self.supabase_request('GET', f'/user_entries?fpl_entry_id=eq.{manager_id}&select=user_id')
+            if not user_result or len(user_result) == 0:
+                logger.warning(f"⚠ No user found for manager {manager_id}")
+                return False
+            
+            user_id = user_result[0]['user_id']
+            
+            # Clear existing picks for this user/gameweek
+            self.supabase_request('DELETE', f'/user_player_ownership?user_id=eq.{user_id}&gameweek_id=eq.{gameweek_id}')
+            
+            # Insert new picks
+            picks = picks_data['picks']
+            success_count = 0
+            
+            for pick in picks:
+                player_id = pick['element']
+                ownership_record = {
+                    'user_id': user_id,
+                    'player_id': player_id,
+                    'gameweek_id': gameweek_id,
+                    'owned': True,
+                    'created_at': self.now_utc().isoformat()
+                }
+                
+                insert_result = self.supabase_request('POST', '/user_player_ownership', [ownership_record])
+                if insert_result is not None:
+                    success_count += 1
+            
+            return success_count > 0
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to sync picks for manager {manager_id} GW{gameweek_id}: {e}")
+            return False
+    
+    def sync_user_picks_for_all_managers(self, gameweek_id: int) -> bool:
+        """Sync user picks for all registered managers for a specific gameweek"""
+        try:
+            manager_ids = self.get_registered_manager_ids()
+            if not manager_ids:
+                logger.info(f"ℹ No registered managers to sync for GW{gameweek_id}")
+                return True
+            
+            success_count = 0
+            for manager_id in manager_ids:
+                if self.sync_user_picks_for_gameweek(manager_id, gameweek_id):
+                    success_count += 1
+            
+            if success_count == len(manager_ids):
+                logger.info(f"✓ Updated picks for {success_count} managers (GW{gameweek_id})")
+            else:
+                logger.warning(f"⚠ Updated picks for {success_count}/{len(manager_ids)} managers (GW{gameweek_id})")
+            return success_count > 0
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to sync picks for GW{gameweek_id}: {e}")
+            return False
+    
+    def sync_team_gw_stats(self) -> bool:
+        """Sync team gameweek stats by calling the populate function"""
+        try:
+            # Call the populate function
+            result = self.supabase_request('POST', '/rpc/populate_team_gw_stats', {})
+            if result is not None:
+                logger.info("✓ Updated team gameweek stats")
+                return True
+            else:
+                logger.error("❌ Failed to populate team gameweek stats")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to sync team gameweek stats: {e}")
+            return False
+    
+    def get_current_gameweek_id(self) -> Optional[int]:
+        """Get current gameweek ID"""
+        try:
+            current_gw = self.supabase_request('GET', '/gameweeks?is_current=eq.true&select=id')
+            if current_gw and len(current_gw) > 0:
+                return current_gw[0]['id']
+            return None
+        except Exception as e:
+            logger.error(f"Error getting current gameweek ID: {e}")
+            return None
+    
+    def get_gameweeks_to_refresh(self) -> List[int]:
+        """Get gameweeks that need refreshing (current + previous gameweek only)"""
+        try:
+            # Get current gameweek
+            current_gw = self.get_current_gameweek_id()
+            if not current_gw:
+                logger.warning("No current gameweek found, skipping player stats refresh")
+                return []
+            
+            # Only refresh current + previous (2 total)
+            # This optimizes performance by skipping completed gameweeks that won't change
+            gameweeks_to_refresh = [current_gw - 1, current_gw] if current_gw > 1 else [current_gw]
+            
+            logger.info(f"Optimized refresh: only refreshing gameweeks {gameweeks_to_refresh} (current={current_gw})")
+            return gameweeks_to_refresh
+            
+        except Exception as e:
+            logger.error(f"Error getting gameweeks to refresh: {e}")
+            return []
     
     def test_connections(self) -> bool:
         """Test all API connections"""
-        logger.info("Testing connections...")
+        logger.info("🔍 Testing connections...")
         
         # Test FPL API
         fpl_data = self.fetch_fpl_data("/bootstrap-static/")
         if not fpl_data:
-            logger.error("❌ Failed to connect to FPL API")
+            logger.error("❌ FPL API connection failed")
             return False
         else:
-            logger.info("✅ FPL API connection successful")
+            logger.info("✓ FPL API connected")
         
         # Test Supabase
         result = self.supabase_request('GET', '/teams?select=count')
         if result is None:
-            logger.error("❌ Failed to connect to Supabase")
+            logger.error("❌ Supabase connection failed")
             return False
         else:
-            logger.info("✅ Supabase connection successful")
+            logger.info("✓ Supabase connected")
         
         return True
     
     def perform_refresh(self) -> bool:
         """Perform complete data refresh"""
-        logger.info("Starting complete FPL data refresh")
+        logger.info("🚀 Starting FPL data refresh")
         
         try:
             # Test connections first
@@ -482,60 +716,80 @@ class FPLService:
             # Fetch bootstrap data
             bootstrap_data = self.fetch_fpl_data("/bootstrap-static/")
             if not bootstrap_data:
-                logger.error("Failed to fetch bootstrap data")
+                logger.error("❌ Failed to fetch bootstrap data")
                 return False
             
             # Sync core data
-            logger.info("Refreshing core tables...")
+            logger.info("📊 Syncing core data...")
             
             teams_success = self.sync_teams(bootstrap_data.get('teams', []))
             players_success = self.sync_players(bootstrap_data.get('elements', []))
             gameweeks_success = self.sync_gameweeks(bootstrap_data.get('events', []))
             
             if not all([teams_success, players_success, gameweeks_success]):
-                logger.error("Failed to sync core data")
+                logger.error("❌ Core data sync failed")
                 return False
             
             # Sync fixtures
             fixtures_data = self.fetch_fpl_data("/fixtures/")
-            if fixtures_data:
-                fixtures_success = self.sync_fixtures(fixtures_data)
-                if not fixtures_success:
-                    logger.error("Failed to sync fixtures")
-                    return False
-            else:
-                logger.error("No fixtures data available")
+            if not fixtures_data:
+                logger.error("❌ No fixtures data available")
                 return False
             
-            # Sync player gameweek stats (for completed gameweeks)
-            logger.info("Syncing player gameweek stats...")
-            completed_gws = [gw for gw in bootstrap_data.get('events', []) if gw.get('finished', False)]
-            max_gw = max([gw['id'] for gw in completed_gws]) if completed_gws else 4
+            if not self.sync_fixtures(fixtures_data):
+                logger.error("❌ Fixtures sync failed")
+                return False
+            
+            # Sync player gameweek stats (optimized - only current + previous gameweek)
+            logger.info("⚽ Syncing player stats...")
+            gameweeks_to_refresh = self.get_gameweeks_to_refresh()
             
             stats_success = True
-            for gw in range(1, max_gw + 1):
+            for gw in gameweeks_to_refresh:
                 if not self.sync_player_gw_stats_from_live(gw):
-                    logger.warning(f"Failed to sync gameweek {gw} stats")
                     stats_success = False
             
             if not stats_success:
-                logger.warning("Some player stats failed to sync")
+                logger.warning("⚠ Some player stats failed")
             
-            logger.info("Complete data refresh finished successfully")
+            # Sync user data (entries and picks)
+            logger.info("👥 Syncing user data...")
+            user_entries_success = self.sync_user_entries()
+            
+            # Sync user picks for optimized gameweeks (current + previous)
+            if gameweeks_to_refresh:
+                user_picks_success = True
+                for gw in gameweeks_to_refresh:
+                    if not self.sync_user_picks_for_all_managers(gw):
+                        user_picks_success = False
+                
+                if not user_picks_success:
+                    logger.warning("⚠ Some user picks failed")
+            
+            if not user_entries_success:
+                logger.warning("⚠ Some user entries failed")
+            
+            # Sync team gameweek stats (aggregated from player_gw_stats and fixtures)
+            logger.info("🏆 Syncing team stats...")
+            team_stats_success = self.sync_team_gw_stats()
+            if not team_stats_success:
+                logger.warning("⚠ Team stats failed")
+            
+            logger.info("✅ Data refresh completed")
             return True
             
         except Exception as e:
-            logger.error(f"Complete refresh failed: {e}")
+            logger.error(f"❌ Refresh failed: {e}")
             return False
     
     def check_once(self) -> bool:
         """Perform a single check for changes and refresh if needed"""
-        logger.info("Performing single change check...")
+        logger.info("🔍 Checking for changes...")
         
         # Get current metrics
         current_metrics = self.get_current_metrics()
         if not current_metrics:
-            logger.error("Failed to get current metrics")
+            logger.error("❌ Failed to get current metrics")
             return False
         
         # Load previous state
@@ -546,77 +800,104 @@ class FPLService:
         changes_detected = self.detect_changes(current_metrics, previous_metrics)
         
         if changes_detected:
-            logger.info("Changes detected, performing refresh...")
+            logger.info("🔄 Changes detected, refreshing...")
             refresh_success = self.perform_refresh()
             
             if refresh_success:
                 # Save new state after successful refresh
-                self.save_current_state(current_metrics)
+                self.save_current_state(current_metrics, refresh_triggered=True)
                 return True
             else:
-                logger.error("Refresh failed, not updating state")
+                logger.error("❌ Refresh failed, not updating state")
                 return False
         else:
-            logger.info("No changes detected, no refresh needed")
             # Still save current state for next check
             self.save_current_state(current_metrics)
             return True
     
     def start_service(self):
         """Start continuous monitoring service"""
-        logger.info("Starting FPL unified data service")
-        logger.info(f"Check interval: {self.check_interval} seconds ({self.check_interval/3600:.1f} hours)")
+        logger.info("🚀 Starting FPL data service")
+        logger.info(f"⏰ Check interval: {self.check_interval/3600:.1f} hours")
         
         try:
             while True:
-                logger.info("=" * 50)
-                logger.info(f"Service check at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                logger.info("─" * 50)
+                logger.info(f"🕐 Service check at {datetime.now().strftime('%m/%d %H:%M:%S')}")
                 
                 # Perform check
                 success = self.check_once()
                 
                 if not success:
-                    logger.error("Check failed, will retry on next interval")
+                    logger.error("❌ Check failed, retrying next interval")
                 
                 # Wait for next check
-                logger.info(f"Waiting {self.check_interval} seconds until next check...")
+                logger.info(f"⏳ Next check in {self.check_interval/3600:.1f} hours")
                 time.sleep(self.check_interval)
                 
         except KeyboardInterrupt:
-            logger.info("Service stopped by user")
+            logger.info("🛑 Service stopped by user")
         except Exception as e:
-            logger.error(f"Service error: {e}")
-            logger.info("Service stopped")
+            logger.error(f"❌ Service error: {e}")
+            logger.info("🛑 Service stopped")
     
     def test_monitoring(self) -> bool:
         """Test monitoring logic without triggering refresh"""
-        logger.info("Testing monitoring logic...")
+        logger.info("🧪 Testing monitoring logic...")
         
         # Get current metrics
         current_metrics = self.get_current_metrics()
         if not current_metrics:
-            logger.error("Failed to get current metrics")
+            logger.error("❌ Failed to get current metrics")
             return False
         
-        logger.info(f"Current metrics: {current_metrics}")
+        logger.info(f"📊 Current: {current_metrics}")
         
         # Load previous state
         previous_state = self.load_previous_state()
         previous_metrics = previous_state.get('metrics', {})
         
         if previous_metrics:
-            logger.info(f"Previous metrics: {previous_metrics}")
+            logger.info(f"📊 Previous: {previous_metrics}")
             changes_detected = self.detect_changes(current_metrics, previous_metrics)
-            logger.info(f"Changes detected: {changes_detected}")
+            logger.info(f"🔄 Changes detected: {changes_detected}")
         else:
-            logger.info("No previous state found, would trigger refresh on first run")
+            logger.info("ℹ No previous state, would trigger refresh on first run")
         
         return True
+    
+    def test_team_gw_stats(self) -> bool:
+        """Test team gameweek stats functionality"""
+        logger.info("🧪 Testing team gameweek stats...")
+        
+        try:
+            # Test if team_gw_stats table exists and has data
+            result = self.supabase_request('GET', '/team_gw_stats?select=count')
+            if result is not None:
+                count = len(result) if isinstance(result, list) else 0
+                logger.info(f"✓ Team stats table: {count} records")
+                
+                # Test a sample query
+                sample = self.supabase_request('GET', '/team_gw_stats?limit=3&select=team_id,gameweek_id,is_home,goals_for,goals_against,total_fantasy_points')
+                if sample:
+                    logger.info(f"✓ Sample data: {sample}")
+                    return True
+                else:
+                    logger.warning("⚠ No sample data found")
+                    return False
+            else:
+                logger.error("❌ Team stats table not accessible")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to test team stats: {e}")
+            return False
 
 def main():
     """Main function"""
     parser = argparse.ArgumentParser(description='FPL Unified Data Service')
     parser.add_argument('--test', action='store_true', help='Test connections and monitoring logic only')
+    parser.add_argument('--test-team-stats', action='store_true', help='Test team gameweek stats functionality')
     parser.add_argument('--once', action='store_true', help='Check once and exit')
     parser.add_argument('--refresh', action='store_true', help='Force immediate refresh')
     
@@ -627,6 +908,8 @@ def main():
     try:
         if args.test:
             success = service.test_monitoring()
+        elif args.test_team_stats:
+            success = service.test_team_gw_stats()
         elif args.refresh:
             success = service.perform_refresh()
         elif args.once:

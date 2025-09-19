@@ -16,10 +16,12 @@ from contextlib import asynccontextmanager
 # Import our modules
 from models import (
     Player, PlayerResponse, Team, TeamResponse, 
-    Fixture, FixtureResponse, Gameweek, GameweekResponse
+    Fixture, FixtureResponse, Gameweek, GameweekResponse,
+    TeamGameweekStats, TeamGameweekStatsResponse, TeamFormTrends, 
+    TeamSeasonSummary, TeamHomeAwayStats
 )
 from database import get_database_connection, init_database, close_database
-from services import PlayerService, TeamService, FixtureService, GameweekService
+from services import PlayerService, TeamService, FixtureService, GameweekService, TeamGameweekStatsService
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -133,6 +135,101 @@ async def get_teams(
         logger.error(f"Error fetching teams: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+# Enhanced team statistics endpoints (must come before /teams/{team_id})
+# Removed materialized view endpoints - using team_gw_stats instead
+
+# Team Gameweek Stats endpoints (must come before /teams/{team_id})
+@app.get("/teams/gameweek-stats", response_model=TeamGameweekStatsResponse)
+async def get_team_gameweek_stats(
+    team_id: Optional[int] = Query(None, description="Filter by team ID"),
+    gameweek_start: Optional[int] = Query(None, description="Start gameweek (inclusive)"),
+    gameweek_end: Optional[int] = Query(None, description="End gameweek (inclusive)"),
+    is_home: Optional[bool] = Query(None, description="Filter by home/away"),
+    opponent_id: Optional[int] = Query(None, description="Filter by opponent team ID"),
+    min_difficulty: Optional[int] = Query(None, description="Minimum fixture difficulty"),
+    max_difficulty: Optional[int] = Query(None, description="Maximum fixture difficulty"),
+    sort_by: Optional[str] = Query("gameweek_id", description="Sort by field"),
+    sort_order: Optional[str] = Query("asc", description="Sort order (asc/desc)"),
+    limit: Optional[int] = Query(50, description="Number of results"),
+    offset: Optional[int] = Query(0, description="Offset for pagination"),
+    db=Depends(get_database_connection)
+):
+    """Get team gameweek statistics with filtering"""
+    try:
+        service = TeamGameweekStatsService(db)
+        stats, total = await service.get_team_gameweek_stats(
+            team_id=team_id,
+            gameweek_start=gameweek_start,
+            gameweek_end=gameweek_end,
+            is_home=is_home,
+            opponent_id=opponent_id,
+            min_difficulty=min_difficulty,
+            max_difficulty=max_difficulty,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            limit=limit,
+            offset=offset
+        )
+        
+        return TeamGameweekStatsResponse(
+            data=stats,
+            total=total,
+            limit=limit,
+            offset=offset
+        )
+    except Exception as e:
+        logger.error(f"Error fetching team gameweek stats: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/teams/form-trends")
+async def get_team_form_trends(
+    team_id: Optional[int] = Query(None, description="Filter by team ID"),
+    gameweek_start: Optional[int] = Query(None, description="Start gameweek (inclusive)"),
+    gameweek_end: Optional[int] = Query(None, description="End gameweek (inclusive)"),
+    limit: Optional[int] = Query(50, description="Number of results"),
+    offset: Optional[int] = Query(0, description="Offset for pagination"),
+    db=Depends(get_database_connection)
+):
+    """Get team form trends with opponent and difficulty information"""
+    try:
+        service = TeamGameweekStatsService(db)
+        trends = await service.get_team_form_trends(
+            team_id=team_id,
+            gameweek_start=gameweek_start,
+            gameweek_end=gameweek_end,
+            limit=limit,
+            offset=offset
+        )
+        return {"trends": trends, "total": len(trends)}
+    except Exception as e:
+        logger.error(f"Error fetching team form trends: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/teams/season-summary")
+async def get_team_season_summary(db=Depends(get_database_connection)):
+    """Get team season summary statistics"""
+    try:
+        service = TeamGameweekStatsService(db)
+        summaries = await service.get_team_season_summary()
+        return {"teams": summaries, "total": len(summaries)}
+    except Exception as e:
+        logger.error(f"Error fetching team season summary: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/teams/home-away-stats")
+async def get_team_home_away_stats(
+    team_id: Optional[int] = Query(None, description="Filter by team ID"),
+    db=Depends(get_database_connection)
+):
+    """Get team home/away performance statistics"""
+    try:
+        service = TeamGameweekStatsService(db)
+        stats = await service.get_team_home_away_stats(team_id=team_id)
+        return {"stats": stats, "total": len(stats)}
+    except Exception as e:
+        logger.error(f"Error fetching team home/away stats: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 @app.get("/teams/{team_id}", response_model=Team)
 async def get_team(team_id: int, db=Depends(get_database_connection)):
     """Get specific team by ID"""
@@ -206,6 +303,8 @@ async def get_current_gameweek(db=Depends(get_database_connection)):
     except Exception as e:
         logger.error(f"Error fetching current gameweek: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+# Duplicate routes removed - defined earlier in file
 
 # Error handlers
 @app.exception_handler(404)
